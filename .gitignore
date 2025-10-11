@@ -47,3 +47,6 @@ htmlcov/
 # Temporary files
 *.tmp
 *.bak
+
+# KUKA source files (examples/test files - not needed in repo)
+*.src
