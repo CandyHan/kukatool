@@ -95,6 +95,30 @@ class OperationDetector:
         self.motion_commands = motion_commands
         self.drilling_operations = []
         self.contouring_operations = []
+        self.z_direction = self._detect_z_direction()
+
+    def _detect_z_direction(self):
+        """Detect Z coordinate system direction / 检测Z坐标系方向
+        Returns: 'negative' if most Z coords are negative, 'positive' if positive
+        """
+        z_coords = []
+        for cmd in self.motion_commands:
+            if cmd.position:
+                z_coords.append(cmd.position.z)
+
+        if not z_coords:
+            return 'negative'  # Default
+
+        # Calculate average Z
+        avg_z = sum(z_coords) / len(z_coords)
+
+        # Detect direction based on average
+        if avg_z < 0:
+            print(f"  ℹ Z-direction: Negative (avg Z = {avg_z:.1f}mm)")
+            return 'negative'
+        else:
+            print(f"  ℹ Z-direction: Positive (avg Z = {avg_z:.1f}mm)")
+            return 'positive'
 
     def detect_all_operations(self):
         """Detect all operations in the program / 检测程序中的所有操作"""
@@ -204,9 +228,11 @@ class OperationDetector:
         cmds = self.motion_commands[start_idx:start_idx+5]
 
         z_coords = []
+        xy_positions = []
         for cmd in cmds:
             if cmd.position:
                 z_coords.append(cmd.position.z)
+                xy_positions.append((cmd.position.x, cmd.position.y))
 
         if len(z_coords) < 5:
             return False
@@ -214,12 +240,39 @@ class OperationDetector:
         # Z should remain relatively constant (within 2mm)
         z_range = max(z_coords) - min(z_coords)
 
-        # Check if Z is in "machining depth" range (negative Z typically)
+        # Check if Z is at "machining depth" range
         avg_z = sum(z_coords) / len(z_coords)
 
-        # Contouring usually happens at negative Z (below reference)
-        # and Z variation is small
-        if z_range < 2.0 and avg_z < -20:  # -20mm threshold for machining depth
+        # Adaptive Z direction detection
+        # For negative Z: below -20mm (machining below reference)
+        # For positive Z: above 300mm (machining above reference, like A005SM at ~391mm)
+        z_threshold_min = 20.0  # Minimum depth threshold
+
+        if self.z_direction == 'negative':
+            # Negative Z system: machining below reference plane
+            z_at_machining_depth = avg_z < -z_threshold_min
+        else:
+            # Positive Z system: machining above reference plane
+            z_at_machining_depth = avg_z > z_threshold_min
+
+        # Check XY movement (contours should have significant XY motion)
+        if len(xy_positions) >= 2:
+            xy_distances = []
+            for i in range(1, len(xy_positions)):
+                dx = xy_positions[i][0] - xy_positions[i-1][0]
+                dy = xy_positions[i][1] - xy_positions[i-1][1]
+                distance = (dx**2 + dy**2)**0.5
+                xy_distances.append(distance)
+
+            total_xy_motion = sum(xy_distances)
+        else:
+            total_xy_motion = 0
+
+        # Contouring criteria:
+        # 1. Z variation is small (within 2mm)
+        # 2. Z is at machining depth
+        # 3. XY motion is significant (>10mm total for 5 points)
+        if z_range < 2.0 and z_at_machining_depth and total_xy_motion > 10.0:
             return True
 
         return False

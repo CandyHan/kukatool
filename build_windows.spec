@@ -15,11 +15,17 @@
 
 block_cipher = None
 
+import os
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+
+# Collect matplotlib data files (fonts, etc.)
+mpl_datas = collect_data_files('matplotlib', include_py_files=False)
+
 a = Analysis(
     ['kuka_gui_editor.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=mpl_datas,  # Include matplotlib data files
     hiddenimports=[
         # Core dependencies
         'numpy',
