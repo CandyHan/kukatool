@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-KUKA .src File Interactive Graphical Editor
+KUKA File Interactive Graphical Editor
 支持在3D可视化中直接操作：
 - Mouse selection of points
 - Real-time coordinate modification
 - Visual preview of modifications
+- 支持文件格式: .src (KUKA), .nc/.NC (G-code)
 """
 
 import sys
@@ -29,21 +30,29 @@ except ImportError:
     HAS_TKINTER = False
 
 
-def simple_file_picker(title="Select file", file_pattern="*.src"):
+def simple_file_picker(title="Select file", file_patterns=["*.src", "*.nc", "*.NC"]):
     """Simple text-based file picker when GUI not available"""
     print(f"\n{'=' * 60}")
     print(f"{title}")
     print(f"{'=' * 60}")
 
-    src_files = glob.glob(file_pattern)
-    if src_files:
-        print(f"\nAvailable {file_pattern} files:")
-        for i, f in enumerate(src_files, 1):
+    # 收集所有匹配的文件
+    all_files = []
+    for pattern in file_patterns:
+        all_files.extend(glob.glob(pattern))
+
+    # 去重并排序
+    all_files = sorted(set(all_files))
+
+    if all_files:
+        print(f"\nAvailable files (.src, .nc, .NC):")
+        for i, f in enumerate(all_files, 1):
             size = os.path.getsize(f) / 1024  # KB
-            print(f"  [{i}] {f:<30} ({size:.1f} KB)")
+            file_type = f.split('.')[-1].upper()
+            print(f"  [{i}] {f:<30} ({size:.1f} KB) [{file_type}]")
 
         print(f"\nOptions:")
-        print(f"  • Enter number (1-{len(src_files)}) to select file")
+        print(f"  • Enter number (1-{len(all_files)}) to select file")
         print(f"  • Enter full path for other file")
         print(f"  • Press Enter to cancel")
 
@@ -51,15 +60,15 @@ def simple_file_picker(title="Select file", file_pattern="*.src"):
             choice = input(f"\nYour choice: ").strip()
             if not choice:
                 return None
-            if choice.isdigit() and 1 <= int(choice) <= len(src_files):
-                return src_files[int(choice) - 1]
+            if choice.isdigit() and 1 <= int(choice) <= len(all_files):
+                return all_files[int(choice) - 1]
             else:
                 return choice if choice else None
         except (EOFError, KeyboardInterrupt):
             print("\n✗ Cancelled")
             return None
     else:
-        print(f"\n✗ No {file_pattern} files found in current directory")
+        print(f"\n✗ No .src or .nc files found in current directory")
         try:
             path = input("Enter full file path (or press Enter to cancel): ").strip()
             return path if path else None
@@ -144,6 +153,9 @@ class OperationDetector:
             else:
                 i += 1
 
+        # 后处理：将大孔（闭合环形轮廓）识别为钻孔操作
+        self._convert_large_holes_to_drilling()
+
         print(f"✓ Detected {len(self.drilling_operations)} drilling operations")
         print(f"✓ Detected {len(self.contouring_operations)} contour operations")
 
@@ -151,8 +163,54 @@ class OperationDetector:
 
     def _is_drilling_pattern(self, start_idx):
         """Check if drilling pattern exists / 检查是否为钻孔模式
-        Pattern: Fast down -> Fast approach -> Slow drill -> Fast up
+        Pattern:
+        - KUKA .src: Fast down -> Fast approach -> Slow drill -> Fast up (4 steps)
+        - NC G-code: Fast to high -> Slow drill down -> Fast up (3 steps)
         """
+        # 先检查3步模式 (NC/G-code钻孔)
+        if start_idx + 2 < len(self.motion_commands):
+            cmds_3 = self.motion_commands[start_idx:start_idx+3]
+
+            # 检查指令类型的多种组合:
+            # 模式1: PTP(G00) -> LIN(G01) -> PTP(G00)
+            # 模式2: LIN -> LIN -> PTP (404座板.NC.nc的模式)
+            is_valid_type_pattern = False
+
+            if len(cmds_3) == 3:
+                types = [cmd.command_type for cmd in cmds_3]
+
+                # 模式1: PTP -> LIN -> PTP
+                if types == ['PTP', 'LIN', 'PTP']:
+                    is_valid_type_pattern = True
+
+                # 模式2: LIN -> LIN -> PTP (快速到高位->进给下钻->快速退回)
+                elif types == ['LIN', 'LIN', 'PTP']:
+                    is_valid_type_pattern = True
+
+                # 模式3: 任意 -> LIN -> PTP (通用模式)
+                elif types[1] == 'LIN' and types[2] == 'PTP':
+                    is_valid_type_pattern = True
+
+            if is_valid_type_pattern:
+                # 检查都有坐标
+                if all(cmd.position for cmd in cmds_3):
+                    z_coords = [cmd.position.z for cmd in cmds_3]
+                    x_coords = [cmd.position.x for cmd in cmds_3]
+                    y_coords = [cmd.position.y for cmd in cmds_3]
+
+                    # 检查XY基本不变（钻孔在同一XY位置）
+                    x_range = max(x_coords) - min(x_coords)
+                    y_range = max(y_coords) - min(y_coords)
+
+                    if x_range < 50.0 and y_range < 50.0:  # 放宽到50mm容差
+                        # 检查Z坐标模式：高->低->高 (向下钻孔)
+                        if z_coords[0] > z_coords[1] and z_coords[2] > z_coords[1]:
+                            z_depth = z_coords[0] - z_coords[1]
+                            # 钻孔深度应该合理（5mm以上）
+                            if z_depth > 5.0:
+                                return True
+
+        # 检查4步模式 (KUKA .src钻孔)
         if start_idx + 3 >= len(self.motion_commands):
             return False
 
@@ -182,22 +240,44 @@ class OperationDetector:
 
     def _extract_drilling_group(self, start_idx, drill_num):
         """Extract drilling operation group / 提取钻孔操作组"""
-        indices = list(range(start_idx, start_idx + 4))
+        # 先检查是3步还是4步模式
+        step_count = 4  # 默认4步（KUKA .src）
+
+        # 检查是否为3步模式 (NC G-code)
+        if start_idx + 2 < len(self.motion_commands):
+            cmds_3 = self.motion_commands[start_idx:start_idx+3]
+            if len(cmds_3) == 3 and all(cmd.position for cmd in cmds_3):
+                types = [cmd.command_type for cmd in cmds_3]
+
+                # 检查多种3步模式
+                is_3step = False
+                if types == ['PTP', 'LIN', 'PTP'] or types == ['LIN', 'LIN', 'PTP']:
+                    is_3step = True
+                elif types[1] == 'LIN' and types[2] == 'PTP':
+                    is_3step = True
+
+                if is_3step:
+                    z_coords_test = [cmd.position.z for cmd in cmds_3]
+                    if z_coords_test[0] > z_coords_test[1] and z_coords_test[2] > z_coords_test[1]:
+                        step_count = 3
+
+        indices = list(range(start_idx, start_idx + step_count))
 
         # Calculate center point (use first point's XY, average Z)
         first_cmd = self.motion_commands[start_idx]
         center_x = first_cmd.position.x
         center_y = first_cmd.position.y
 
-        z_coords = [self.motion_commands[i].position.z for i in indices]
-        center_z = sum(z_coords) / len(z_coords)
+        z_coords = [self.motion_commands[i].position.z for i in indices if i < len(self.motion_commands)]
+        center_z = sum(z_coords) / len(z_coords) if z_coords else 0
 
         center = np.array([center_x, center_y, center_z])
 
         # Calculate bounds
         all_coords = [(self.motion_commands[i].position.x,
                       self.motion_commands[i].position.y,
-                      self.motion_commands[i].position.z) for i in indices]
+                      self.motion_commands[i].position.z) for i in indices
+                      if i < len(self.motion_commands) and self.motion_commands[i].position]
         xs, ys, zs = zip(*all_coords)
         bounds = (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
 
@@ -205,7 +285,8 @@ class OperationDetector:
         properties = {
             'drill_depth': max(z_coords) - min(z_coords),
             'safe_height': max(z_coords),
-            'bottom_depth': min(z_coords)
+            'bottom_depth': min(z_coords),
+            'step_count': step_count
         }
 
         return OperationGroup(
@@ -217,22 +298,131 @@ class OperationDetector:
             properties=properties
         )
 
+    def _convert_large_holes_to_drilling(self):
+        """将大孔（闭合环形轮廓）转换为钻孔操作"""
+        # 识别需要转换的轮廓
+        large_hole_contours = []
+        remaining_contours = []
+
+        for contour in self.contouring_operations:
+            # 获取轮廓点
+            points = [self.motion_commands[i].position for i in contour.indices
+                     if i < len(self.motion_commands) and self.motion_commands[i].position]
+
+            if not points:
+                remaining_contours.append(contour)
+                continue
+
+            # 计算半径
+            center_x = contour.center[0]
+            center_y = contour.center[1]
+            distances = [np.sqrt((p.x - center_x)**2 + (p.y - center_y)**2) for p in points]
+            avg_radius = sum(distances) / len(distances)
+
+            # 检查闭合度
+            start = np.array([points[0].x, points[0].y])
+            end = np.array([points[-1].x, points[-1].y])
+            closure = np.linalg.norm(end - start)
+
+            # 大孔条件：半径2-20mm，点数>20，闭合良好(<10mm)
+            if 2.0 < avg_radius < 20.0 and len(points) > 20 and closure < 10.0:
+                large_hole_contours.append((contour, avg_radius))
+            else:
+                remaining_contours.append(contour)
+
+        # 将大孔转换为钻孔操作
+        drill_start_num = len(self.drilling_operations)
+        for i, (contour, radius) in enumerate(large_hole_contours):
+            # 获取轮廓的索引列表（副本）
+            indices = list(contour.indices)
+
+            # 向前查找并包含快速定位指令（作为钻孔操作的一部分）
+            # 这样移动和删除时会一起处理
+            start_idx = indices[0]
+            end_idx = indices[-1]
+            transition_indices_before = []
+            transition_indices_after = []
+
+            # 向前查找进入孔的过渡指令
+            for idx in range(max(0, start_idx - 3), start_idx):
+                cmd = self.motion_commands[idx]
+                if cmd.position:
+                    # 检查是否是快速定位到这个孔附近（XY距离<100mm，Z>600mm）
+                    dx = cmd.position.x - contour.center[0]
+                    dy = cmd.position.y - contour.center[1]
+                    distance = (dx**2 + dy**2)**0.5
+
+                    if distance < 100.0 and cmd.position.z > 600.0:
+                        # 这是定位到当前孔的指令，应该包含在钻孔操作中
+                        transition_indices_before.append(idx)
+
+            # 向后查找退出孔的快速返回指令
+            # 查找紧接在轮廓结束后的1-2个指令
+            for idx in range(end_idx + 1, min(end_idx + 3, len(self.motion_commands))):
+                cmd = self.motion_commands[idx]
+                if cmd.position:
+                    # 检查是否是快速返回到安全高度（Z>600mm，且命令类型为PTP/G00）
+                    # 且XY位置接近孔中心（距离<100mm）
+                    dx = cmd.position.x - contour.center[0]
+                    dy = cmd.position.y - contour.center[1]
+                    distance = (dx**2 + dy**2)**0.5
+
+                    if distance < 100.0 and cmd.position.z > 600.0 and cmd.command_type in ['PTP', 'G00']:
+                        # 这是从当前孔快速退回的指令
+                        transition_indices_after.append(idx)
+                    else:
+                        # 遇到非快速返回指令，停止查找
+                        break
+
+            # 将过渡指令添加到索引的开头和结尾
+            indices = transition_indices_before + indices + transition_indices_after
+
+            # 创建钻孔操作组
+            drill_op = OperationGroup(
+                name=f"Drill_{drill_start_num + i + 1}",
+                type=OperationType.DRILLING,
+                indices=indices,  # 现在包含了进入和退出的过渡指令
+                center=contour.center,
+                bounds=contour.bounds,
+                properties={
+                    'drill_depth': radius * 2,  # 用直径作为深度
+                    'safe_height': contour.center[2],
+                    'bottom_depth': contour.center[2],
+                    'step_count': len(indices),  # 更新步骤数
+                    'is_large_hole': True,  # 标记为大孔
+                    'radius': radius
+                }
+            )
+            self.drilling_operations.append(drill_op)
+
+        # 更新轮廓列表
+        self.contouring_operations = remaining_contours
+
     def _is_contouring_pattern(self, start_idx):
         """Check if contouring pattern exists / 检查是否为轮廓加工模式
         Pattern: Z remains relatively constant, XY changes continuously
         """
-        if start_idx + 5 >= len(self.motion_commands):
+        if start_idx >= len(self.motion_commands):
             return False
 
-        # Check at least 5 consecutive points
-        cmds = self.motion_commands[start_idx:start_idx+5]
+        # 只检查LIN指令作为轮廓起点（排除PTP快速定位）
+        start_cmd = self.motion_commands[start_idx]
+        if start_cmd.command_type != 'LIN' or not start_cmd.position:
+            return False
 
+        # Check at least 5 consecutive points with positions
+        # 向后查找足够的点（最多检查20个指令以收集5个有效点）
         z_coords = []
         xy_positions = []
-        for cmd in cmds:
+        check_limit = min(start_idx + 20, len(self.motion_commands))
+
+        for idx in range(start_idx, check_limit):
+            cmd = self.motion_commands[idx]
             if cmd.position:
                 z_coords.append(cmd.position.z)
                 xy_positions.append((cmd.position.x, cmd.position.y))
+                if len(z_coords) >= 5:
+                    break
 
         if len(z_coords) < 5:
             return False
@@ -271,8 +461,8 @@ class OperationDetector:
         # Contouring criteria:
         # 1. Z variation is small (within 2mm)
         # 2. Z is at machining depth
-        # 3. XY motion is significant (>10mm total for 5 points)
-        if z_range < 2.0 and z_at_machining_depth and total_xy_motion > 10.0:
+        # 3. XY motion is significant (>1mm total for 5 points, 降低阈值以识别小圆弧)
+        if z_range < 2.0 and z_at_machining_depth and total_xy_motion > 1.0:
             return True
 
         return False
@@ -284,15 +474,25 @@ class OperationDetector:
         base_z = self.motion_commands[start_idx].position.z
 
         i = start_idx + 1
+        consecutive_breaks = 0  # 连续中断计数
+
         while i < len(self.motion_commands):
             cmd = self.motion_commands[i]
-            if cmd.position:
+
+            # 如果是LIN指令且有位置信息
+            if cmd.command_type == 'LIN' and cmd.position:
                 if abs(cmd.position.z - base_z) < 2.0:  # Same Z level
                     indices.append(i)
+                    consecutive_breaks = 0  # 重置中断计数
                     i += 1
                 else:
+                    # Z变化过大，轮廓结束
                     break
             else:
+                # 非LIN指令或无位置，允许少量中断（如PTP定位）
+                consecutive_breaks += 1
+                if consecutive_breaks > 2:  # 连续超过2个非加工指令，轮廓结束
+                    break
                 i += 1
 
         # Calculate center
@@ -927,6 +1127,7 @@ Contouring: {len(self.contouring_operations)} ({len(self.selected_contour_names)
             return
 
         # Collect all indices to delete
+        # 注意：大孔的indices已经在_convert_large_holes_to_drilling()中包含了前面的过渡指令
         indices_to_delete = set()
         for drill_op in self.drilling_operations:
             if drill_op.name in self.selected_drilling_names:
@@ -1045,8 +1246,20 @@ Contouring: {len(self.contouring_operations)} ({len(self.selected_contour_names)
         if file_path and os.path.exists(file_path):
             try:
                 print(f"\n✓ Loading file: {file_path}")
-                # Parse new file
-                new_parser = KUKASrcParser(file_path)
+
+                # 根据文件扩展名选择合适的解析器
+                file_ext = os.path.splitext(file_path)[1].lower()
+
+                if file_ext in ['.nc', '.NC']:
+                    # 使用NC解析器
+                    from kuka_nc_parser import KukaNCParser
+                    new_parser = KukaNCParser(file_path)
+                    print("  ℹ Using NC/G-code parser")
+                else:
+                    # 默认使用SRC解析器
+                    new_parser = KUKASrcParser(file_path)
+                    print("  ℹ Using KUKA SRC parser")
+
                 new_parser.parse()
 
                 # Update current parser
@@ -1068,11 +1281,13 @@ Contouring: {len(self.contouring_operations)} ({len(self.selected_contour_names)
                 print(f"✓ File loaded successfully: {file_path}")
             except Exception as e:
                 print(f"✗ Error loading file: {e}")
+                import traceback
+                traceback.print_exc()
         elif file_path:
             print(f"✗ File not found: {file_path}")
 
     def open_file(self, event):
-        """Open file dialog to select a .src file / 打开文件对话框选择.src文件"""
+        """Open file dialog to select a file / 打开文件对话框选择文件"""
         file_path = None
 
         if HAS_TKINTER:
@@ -1081,17 +1296,22 @@ Contouring: {len(self.contouring_operations)} ({len(self.selected_contour_names)
             root.withdraw()  # Hide the main window
             root.attributes('-topmost', True)  # Make dialog appear on top
 
-            # Open file dialog
+            # Open file dialog - 支持多种文件类型
             file_path = filedialog.askopenfilename(
-                title='Select KUKA .src file',
-                filetypes=[('KUKA Source Files', '*.src'), ('All Files', '*.*')],
+                title='Select KUKA file (.src, .nc)',
+                filetypes=[
+                    ('All Supported', '*.src *.nc *.NC'),
+                    ('KUKA Source Files', '*.src'),
+                    ('NC/G-code Files', '*.nc *.NC'),
+                    ('All Files', '*.*')
+                ],
                 initialdir='.'
             )
 
             root.destroy()  # Clean up
         else:
             # Use simple text-based file picker
-            file_path = simple_file_picker(title="Select KUKA .src file", file_pattern="*.src")
+            file_path = simple_file_picker(title="Select KUKA file (.src, .nc, .NC)")
 
         # Load the selected file
         if file_path:
@@ -1105,24 +1325,50 @@ Contouring: {len(self.contouring_operations)} ({len(self.selected_contour_names)
 
         file_path = None
 
+        # 检测原始文件类型
+        original_ext = os.path.splitext(self.parser.filename)[1].lower()
+        is_nc_file = original_ext in ['.nc', '.NC']
+
         if HAS_TKINTER:
             # Use tkinter save dialog
             root = tk.Tk()
             root.withdraw()
             root.attributes('-topmost', True)
 
+            # 根据原始文件类型设置保存对话框
+            if is_nc_file:
+                default_ext = '.nc'
+                filetypes = [
+                    ('NC/G-code Files', '*.nc *.NC'),
+                    ('KUKA Source Files', '*.src'),
+                    ('All Files', '*.*')
+                ]
+                default_name = self.parser.filename.replace(original_ext, f'_modified{original_ext}')
+            else:
+                default_ext = '.src'
+                filetypes = [
+                    ('KUKA Source Files', '*.src'),
+                    ('NC/G-code Files', '*.nc *.NC'),
+                    ('All Files', '*.*')
+                ]
+                default_name = self.parser.filename.replace('.src', '_modified.src')
+
             # Open save dialog
             file_path = filedialog.asksaveasfilename(
                 title='Save Modified File',
-                defaultextension='.src',
-                filetypes=[('KUKA Source Files', '*.src'), ('All Files', '*.*')],
-                initialfile=self.parser.filename.replace('.src', '_modified.src')
+                defaultextension=default_ext,
+                filetypes=filetypes,
+                initialfile=os.path.basename(default_name)
             )
 
             root.destroy()
         else:
             # Simple text-based save dialog
-            default_name = self.parser.filename.replace('.src', '_modified.src')
+            if is_nc_file:
+                default_name = self.parser.filename.replace(original_ext, f'_modified{original_ext}')
+            else:
+                default_name = self.parser.filename.replace('.src', '_modified.src')
+
             print(f"\n{'=' * 60}")
             print(f"Save Modified File")
             print(f"{'=' * 60}")
@@ -1143,10 +1389,29 @@ Contouring: {len(self.contouring_operations)} ({len(self.selected_contour_names)
 
         if file_path:
             try:
-                self.parser.export_to_src(file_path)
+                # 根据保存的文件扩展名选择导出方法
+                save_ext = os.path.splitext(file_path)[1].lower()
+
+                if save_ext in ['.nc', '.NC']:
+                    # 导出为NC文件
+                    if hasattr(self.parser, 'export_to_nc'):
+                        self.parser.export_to_nc(file_path)
+                    else:
+                        print("✗ Current parser doesn't support NC export")
+                        return
+                else:
+                    # 导出为SRC文件
+                    if hasattr(self.parser, 'export_to_src'):
+                        self.parser.export_to_src(file_path)
+                    else:
+                        print("✗ Current parser doesn't support SRC export")
+                        return
+
                 print(f"\n✓ File saved to: {file_path}")
             except Exception as e:
                 print(f"✗ Error saving file: {e}")
+                import traceback
+                traceback.print_exc()
 
     def show(self):
         """Display GUI / 显示GUI"""

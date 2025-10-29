@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-KUKA .src 文件动画播放器
+KUKA 文件动画播放器
 顺序播放加工路径，像看视频一样
 支持播放、暂停、快进、慢放
+支持文件格式: .src (KUKA), .nc/.NC (G-code)
 """
 
 import sys
@@ -25,21 +26,29 @@ except ImportError:
     HAS_TKINTER = False
 
 
-def simple_file_picker(title="Select file", file_pattern="*.src"):
+def simple_file_picker(title="Select file", file_patterns=["*.src", "*.nc", "*.NC"]):
     """Simple text-based file picker when GUI not available"""
     print(f"\n{'=' * 60}")
     print(f"{title}")
     print(f"{'=' * 60}")
 
-    src_files = glob.glob(file_pattern)
-    if src_files:
-        print(f"\nAvailable {file_pattern} files:")
-        for i, f in enumerate(src_files, 1):
+    # 收集所有匹配的文件
+    all_files = []
+    for pattern in file_patterns:
+        all_files.extend(glob.glob(pattern))
+
+    # 去重并排序
+    all_files = sorted(set(all_files))
+
+    if all_files:
+        print(f"\nAvailable files (.src, .nc, .NC):")
+        for i, f in enumerate(all_files, 1):
             size = os.path.getsize(f) / 1024  # KB
-            print(f"  [{i}] {f:<30} ({size:.1f} KB)")
+            file_type = f.split('.')[-1].upper()
+            print(f"  [{i}] {f:<30} ({size:.1f} KB) [{file_type}]")
 
         print(f"\nOptions:")
-        print(f"  • Enter number (1-{len(src_files)}) to select file")
+        print(f"  • Enter number (1-{len(all_files)}) to select file")
         print(f"  • Enter full path for other file")
         print(f"  • Press Enter to cancel")
 
@@ -47,15 +56,15 @@ def simple_file_picker(title="Select file", file_pattern="*.src"):
             choice = input(f"\nYour choice: ").strip()
             if not choice:
                 return None
-            if choice.isdigit() and 1 <= int(choice) <= len(src_files):
-                return src_files[int(choice) - 1]
+            if choice.isdigit() and 1 <= int(choice) <= len(all_files):
+                return all_files[int(choice) - 1]
             else:
                 return choice if choice else None
         except (EOFError, KeyboardInterrupt):
             print("\n✗ Cancelled")
             return None
     else:
-        print(f"\n✗ No {file_pattern} files found in current directory")
+        print(f"\n✗ No .src or .nc files found in current directory")
         try:
             path = input("Enter full file path (or press Enter to cancel): ").strip()
             return path if path else None
@@ -346,6 +355,11 @@ load a KUKA .src file"""
         if self.current_frame >= self.total_points:
             return
 
+        # 检查绘图对象是否存在
+        if not hasattr(self, 'current_point_3d'):
+            # 绘图对象未初始化，先初始化
+            return
+
         # 更新当前点
         current_pos = self.points[self.current_frame]
         current_ori = self.orientations[self.current_frame]
@@ -560,8 +574,20 @@ Orientation:
         if file_path and os.path.exists(file_path):
             try:
                 print(f"\n✓ Loading file: {file_path}")
-                # Parse new file
-                new_parser = KUKASrcParser(file_path)
+
+                # 根据文件扩展名选择合适的解析器
+                file_ext = os.path.splitext(file_path)[1].lower()
+
+                if file_ext in ['.nc', '.NC']:
+                    # 使用NC解析器
+                    from kuka_nc_parser import KukaNCParser
+                    new_parser = KukaNCParser(file_path)
+                    print("  ℹ Using NC/G-code parser")
+                else:
+                    # 默认使用SRC解析器
+                    new_parser = KUKASrcParser(file_path)
+                    print("  ℹ Using KUKA SRC parser")
+
                 new_parser.parse()
 
                 # Update parser
@@ -593,7 +619,7 @@ Orientation:
             print(f"✗ File not found: {file_path}")
 
     def open_file(self, event):
-        """打开文件对话框选择.src文件"""
+        """打开文件对话框选择文件"""
         # Pause animation if playing
         if self.is_playing:
             self.is_playing = False
@@ -609,16 +635,22 @@ Orientation:
             root.withdraw()
             root.attributes('-topmost', True)
 
+            # 支持多种文件类型
             file_path = filedialog.askopenfilename(
-                title='Select KUKA .src file',
-                filetypes=[('KUKA Source Files', '*.src'), ('All Files', '*.*')],
+                title='Select KUKA file (.src, .nc)',
+                filetypes=[
+                    ('All Supported', '*.src *.nc *.NC'),
+                    ('KUKA Source Files', '*.src'),
+                    ('NC/G-code Files', '*.nc *.NC'),
+                    ('All Files', '*.*')
+                ],
                 initialdir='.'
             )
 
             root.destroy()
         else:
             # Use simple text-based file picker
-            file_path = simple_file_picker(title="Select KUKA .src file", file_pattern="*.src")
+            file_path = simple_file_picker(title="Select KUKA file (.src, .nc, .NC)")
 
         # Load the selected file
         if file_path:
@@ -650,9 +682,20 @@ def main():
 
     # Only use command line argument if provided
     if len(sys.argv) >= 2:
-        src_file = sys.argv[1]
-        print(f"正在加载文件: {src_file}")
-        parser = KUKASrcParser(src_file)
+        input_file = sys.argv[1]
+        print(f"正在加载文件: {input_file}")
+
+        # 根据文件扩展名选择解析器
+        file_ext = os.path.splitext(input_file)[1].lower()
+
+        if file_ext in ['.nc', '.NC']:
+            from kuka_nc_parser import KukaNCParser
+            parser = KukaNCParser(input_file)
+            print("  ℹ 使用NC/G-code解析器")
+        else:
+            parser = KUKASrcParser(input_file)
+            print("  ℹ 使用KUKA SRC解析器")
+
         parser.parse()
 
     print("\n启动KUKA动画播放器...")
