@@ -542,6 +542,12 @@ class InteractiveKUKAEditor:
         self.selected_drilling_names = set()
         self.selected_contour_names = set()
 
+        # Initialize view state variables
+        self.initial_xlim = None
+        self.initial_ylim = None
+        self.initial_zlim = None
+        self.user_has_zoomed = False
+
         # Extract data if parser is provided
         if parser:
             self.extract_data()
@@ -675,11 +681,63 @@ class InteractiveKUKAEditor:
                                        family='monospace', verticalalignment='bottom')
         self.update_info()
 
-        # Connect mouse click event for selection
+        # === View Control Panel / 视图控制面板 ===
+        view_panel_top = 0.20
+        self.fig.text(0.02, view_panel_top + 0.02, 'View Controls:', fontsize=10, fontweight='bold')
+
+        # Zoom buttons / 缩放按钮
+        ax_zoom_in = self.fig.add_axes([0.02, view_panel_top - 0.03, 0.08, 0.03])
+        self.btn_zoom_in = Button(ax_zoom_in, 'Zoom In (+)', color='lightblue')
+        self.btn_zoom_in.on_clicked(self.zoom_in)
+
+        ax_zoom_out = self.fig.add_axes([0.11, view_panel_top - 0.03, 0.08, 0.03])
+        self.btn_zoom_out = Button(ax_zoom_out, 'Zoom Out (-)', color='lightblue')
+        self.btn_zoom_out.on_clicked(self.zoom_out)
+
+        ax_reset_view = self.fig.add_axes([0.20, view_panel_top - 0.03, 0.08, 0.03])
+        self.btn_reset_view = Button(ax_reset_view, 'Reset View', color='lightgray')
+        self.btn_reset_view.on_clicked(self.reset_view)
+
+        # View presets / 视角预设
+        ax_view_top = self.fig.add_axes([0.02, view_panel_top - 0.07, 0.06, 0.03])
+        self.btn_view_top = Button(ax_view_top, 'Top', color='wheat')
+        self.btn_view_top.on_clicked(lambda e: self.set_view_angle(90, -90))
+
+        ax_view_front = self.fig.add_axes([0.09, view_panel_top - 0.07, 0.06, 0.03])
+        self.btn_view_front = Button(ax_view_front, 'Front', color='wheat')
+        self.btn_view_front.on_clicked(lambda e: self.set_view_angle(0, -90))
+
+        ax_view_side = self.fig.add_axes([0.16, view_panel_top - 0.07, 0.06, 0.03])
+        self.btn_view_side = Button(ax_view_side, 'Side', color='wheat')
+        self.btn_view_side.on_clicked(lambda e: self.set_view_angle(0, 0))
+
+        ax_view_iso = self.fig.add_axes([0.23, view_panel_top - 0.07, 0.06, 0.03])
+        self.btn_view_iso = Button(ax_view_iso, 'Iso', color='wheat')
+        self.btn_view_iso.on_clicked(lambda e: self.set_view_angle(30, -60))
+
+        # Connect mouse events for selection and zoom
         self.fig.canvas.mpl_connect('button_press_event', self.on_canvas_click)
+        self.fig.canvas.mpl_connect('scroll_event', self.on_scroll)
 
     def update_3d_plot(self):
         """Update 3D view / 更新3D视图"""
+        # Save current view limits if user has zoomed
+        saved_xlim = None
+        saved_ylim = None
+        saved_zlim = None
+        saved_elev = None
+        saved_azim = None
+
+        if self.user_has_zoomed:
+            try:
+                saved_xlim = self.ax_3d.get_xlim()
+                saved_ylim = self.ax_3d.get_ylim()
+                saved_zlim = self.ax_3d.get_zlim()
+                saved_elev = self.ax_3d.elev
+                saved_azim = self.ax_3d.azim
+            except:
+                pass
+
         self.ax_3d.clear()
 
         # Check if parser exists
@@ -789,9 +847,24 @@ class InteractiveKUKAEditor:
             mid_y = (self.points[:, 1].max() + self.points[:, 1].min()) * 0.5
             mid_z = (self.points[:, 2].max() + self.points[:, 2].min()) * 0.5
 
-            self.ax_3d.set_xlim(mid_x - max_range, mid_x + max_range)
-            self.ax_3d.set_ylim(mid_y - max_range, mid_y + max_range)
-            self.ax_3d.set_zlim(mid_z - max_range, mid_z + max_range)
+            # Only set default view limits if user hasn't zoomed
+            if not self.user_has_zoomed or saved_xlim is None:
+                self.ax_3d.set_xlim(mid_x - max_range, mid_x + max_range)
+                self.ax_3d.set_ylim(mid_y - max_range, mid_y + max_range)
+                self.ax_3d.set_zlim(mid_z - max_range, mid_z + max_range)
+            else:
+                # Restore user's zoom state
+                self.ax_3d.set_xlim(saved_xlim)
+                self.ax_3d.set_ylim(saved_ylim)
+                self.ax_3d.set_zlim(saved_zlim)
+                if saved_elev is not None and saved_azim is not None:
+                    self.ax_3d.view_init(elev=saved_elev, azim=saved_azim)
+
+            # Save initial view limits for reset (only once)
+            if self.initial_xlim is None:
+                self.initial_xlim = (mid_x - max_range, mid_x + max_range)
+                self.initial_ylim = (mid_y - max_range, mid_y + max_range)
+                self.initial_zlim = (mid_z - max_range, mid_z + max_range)
 
         self.fig.canvas.draw_idle()
 
@@ -1116,6 +1189,12 @@ Contouring: {len(self.contouring_operations)} ({len(self.selected_contour_names)
         detector = OperationDetector(self.parser.motion_commands)
         self.drilling_operations, self.contouring_operations = detector.detect_all_operations()
 
+        # Reset zoom state
+        self.user_has_zoomed = False
+        self.initial_xlim = None
+        self.initial_ylim = None
+        self.initial_zlim = None
+
         self.update_3d_plot()
         self.update_info()
         print("✓ All changes undone")  # 已撤销所有修改
@@ -1270,6 +1349,12 @@ Contouring: {len(self.contouring_operations)} ({len(self.selected_contour_names)
                 self.selected_drilling_names.clear()
                 self.selected_contour_names.clear()
 
+                # Reset zoom state for new file
+                self.user_has_zoomed = False
+                self.initial_xlim = None
+                self.initial_ylim = None
+                self.initial_zlim = None
+
                 # Re-detect operations
                 detector = OperationDetector(self.parser.motion_commands)
                 self.drilling_operations, self.contouring_operations = detector.detect_all_operations()
@@ -1412,6 +1497,125 @@ Contouring: {len(self.contouring_operations)} ({len(self.selected_contour_names)
                 print(f"✗ Error saving file: {e}")
                 import traceback
                 traceback.print_exc()
+
+    def zoom_in(self, event):
+        """Zoom in the 3D view / 放大视图"""
+        if not self.parser:
+            return
+
+        # Get current limits
+        xlim = self.ax_3d.get_xlim()
+        ylim = self.ax_3d.get_ylim()
+        zlim = self.ax_3d.get_zlim()
+
+        # Calculate center
+        x_center = (xlim[0] + xlim[1]) / 2
+        y_center = (ylim[0] + ylim[1]) / 2
+        z_center = (zlim[0] + zlim[1]) / 2
+
+        # Zoom factor: 0.8 makes the view range smaller (zoom in)
+        zoom_factor = 0.8
+        x_range = (xlim[1] - xlim[0]) * zoom_factor / 2
+        y_range = (ylim[1] - ylim[0]) * zoom_factor / 2
+        z_range = (zlim[1] - zlim[0]) * zoom_factor / 2
+
+        # Set new limits
+        self.ax_3d.set_xlim(x_center - x_range, x_center + x_range)
+        self.ax_3d.set_ylim(y_center - y_range, y_center + y_range)
+        self.ax_3d.set_zlim(z_center - z_range, z_center + z_range)
+
+        self.user_has_zoomed = True  # Mark that user has zoomed
+        self.fig.canvas.draw_idle()
+
+    def zoom_out(self, event):
+        """Zoom out the 3D view / 缩小视图"""
+        if not self.parser:
+            return
+
+        # Get current limits
+        xlim = self.ax_3d.get_xlim()
+        ylim = self.ax_3d.get_ylim()
+        zlim = self.ax_3d.get_zlim()
+
+        # Calculate center
+        x_center = (xlim[0] + xlim[1]) / 2
+        y_center = (ylim[0] + ylim[1]) / 2
+        z_center = (zlim[0] + zlim[1]) / 2
+
+        # Zoom factor: 1.25 makes the view range larger (zoom out)
+        zoom_factor = 1.25
+        x_range = (xlim[1] - xlim[0]) * zoom_factor / 2
+        y_range = (ylim[1] - ylim[0]) * zoom_factor / 2
+        z_range = (zlim[1] - zlim[0]) * zoom_factor / 2
+
+        # Set new limits
+        self.ax_3d.set_xlim(x_center - x_range, x_center + x_range)
+        self.ax_3d.set_ylim(y_center - y_range, y_center + y_range)
+        self.ax_3d.set_zlim(z_center - z_range, z_center + z_range)
+
+        self.user_has_zoomed = True  # Mark that user has zoomed
+        self.fig.canvas.draw_idle()
+
+    def reset_view(self, event):
+        """Reset view to initial state / 重置视图"""
+        if not self.parser or self.initial_xlim is None:
+            return
+
+        self.ax_3d.set_xlim(self.initial_xlim)
+        self.ax_3d.set_ylim(self.initial_ylim)
+        self.ax_3d.set_zlim(self.initial_zlim)
+
+        # Reset to default 3D view angle
+        self.ax_3d.view_init(elev=30, azim=-60)
+
+        self.user_has_zoomed = False  # Clear zoom state
+        self.fig.canvas.draw_idle()
+        print("✓ View reset to initial state")
+
+    def set_view_angle(self, elev, azim):
+        """Set view angle / 设置视角"""
+        if not self.parser:
+            return
+
+        self.ax_3d.view_init(elev=elev, azim=azim)
+        self.fig.canvas.draw_idle()
+
+    def on_scroll(self, event):
+        """Handle mouse scroll for zoom / 处理鼠标滚轮缩放"""
+        # Only handle scroll in 3D axes
+        if event.inaxes != self.ax_3d:
+            return
+
+        if not self.parser:
+            return
+
+        # Get current limits
+        xlim = self.ax_3d.get_xlim()
+        ylim = self.ax_3d.get_ylim()
+        zlim = self.ax_3d.get_zlim()
+
+        # Calculate center
+        x_center = (xlim[0] + xlim[1]) / 2
+        y_center = (ylim[0] + ylim[1]) / 2
+        z_center = (zlim[0] + zlim[1]) / 2
+
+        # Zoom factor based on scroll direction
+        if event.button == 'up':
+            zoom_factor = 0.9  # Zoom in
+        else:
+            zoom_factor = 1.1  # Zoom out
+
+        x_range = (xlim[1] - xlim[0]) * zoom_factor / 2
+        y_range = (ylim[1] - ylim[0]) * zoom_factor / 2
+        z_range = (zlim[1] - zlim[0]) * zoom_factor / 2
+
+        # Set new limits
+        self.ax_3d.set_xlim(x_center - x_range, x_center + x_range)
+        self.ax_3d.set_ylim(y_center - y_range, y_center + y_range)
+        self.ax_3d.set_zlim(z_center - z_range, z_center + z_range)
+
+        self.user_has_zoomed = True  # Mark that user has zoomed
+        self.fig.canvas.draw_idle()
 
     def show(self):
         """Display GUI / 显示GUI"""
